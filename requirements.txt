@@ -1,0 +1,9 @@
+alpaca-trade-api==3.0.0
+numpy
+pandas
+scipy
+ta
+EMD-signal
+scikit-learn
+tensorflow
+stable-baselines3==2.6.0
