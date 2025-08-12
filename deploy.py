@@ -14,49 +14,38 @@ from alpaca_trade_api.rest import REST, TimeFrame, APIError
 # ── CONFIG ───────────────────────────────────────────────────────────────
 TICKERS = ["AAPL", "JPM", "AMZN", "TSLA", "MSFT"]
 
-# Must match training:
-WINDOW = int(os.environ.get("RL_WINDOW", 20))   # price window length W
+# Must match training (51-dim obs = K*WINDOW + 1 + K; with K=5 → WINDOW=9)
+WINDOW = int(os.environ.get("RL_WINDOW", 9))   # price window length W
 MODEL_PATH = os.environ.get("MODEL_PATH", "ppo_ceemd_cnnlstm_rl.zip")
 
 INITIAL_CASH = float(os.environ.get("INITIAL_CASH", 10_000))
-SLEEP_INTERVAL = int(os.environ.get("SLEEP_INTERVAL", 60))  # seconds
+SLEEP_INTERVAL = int(os.environ.get("SLEEP_INTERVAL", 60))  # seconds between loops
 
 # Alpaca creds
 ALPACA_API_KEY    = os.environ["ALPACA_API_KEY"]
 ALPACA_SECRET_KEY = os.environ["ALPACA_SECRET_KEY"]
 ALPACA_BASE_URL   = os.environ.get("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
 
-# Timeframe + feed (so deployment matches training)
+# Timeframe + feed (match training)
 # ALPACA_TIMEFRAME: "minute" or "day"
 ALPACA_TIMEFRAME = os.environ.get("ALPACA_TIMEFRAME", "minute").lower()
 ALPACA_FEED      = os.environ.get("ALPACA_FEED", "iex")  # "iex" (free) or "sip" (paid)
 
-# Lookback amounts to ensure indicator warmups are satisfied
-HIST_LOOKBACK_MINUTES = int(os.environ.get("HIST_LOOKBACK_MINUTES", 1200))  # ~20 hours of minutes
-HIST_LOOKBACK_DAYS    = int(os.environ.get("HIST_LOOKBACK_DAYS", 120))      # ~6 months daily
+# Lookback to ensure enough bars for WINDOW even at market open
+HIST_LOOKBACK_MINUTES = int(os.environ.get("HIST_LOOKBACK_MINUTES", 1200))  # ~20 hours minutes
+HIST_LOOKBACK_DAYS    = int(os.environ.get("HIST_LOOKBACK_DAYS", 120))      # ~6 months days
 
-# Indicators used in training:
-# RSI(14), MACD(12,26,9), BB width(20,2), Ret (1), Vol20 (20), VolZ60 (60)
-RSI_WIN = 14
-MACD_FAST, MACD_SLOW, MACD_SIG = 12, 26, 9
-BB_WIN, BB_DEV = 20, 2
-RET_WIN = 1
-VOL_WIN = 20
-VOLZ_WIN = 60
-
-# Grab plenty of history to avoid NaNs from warmups
-HIST_N = max(300, WINDOW + MACD_SLOW + 50, VOLZ_WIN + 50, BB_WIN + 50)
+# Safety buffer for history slicing
+HIST_N = max(3 * WINDOW, 300)
 
 # ── RL AGENT ─────────────────────────────────────────────────────────────
 def _const(v):
     return lambda _progress: v
 
-# Strip ".zip" to avoid accidental ".zip.zip" in some loaders
 _model_path_stem = MODEL_PATH[:-4] if MODEL_PATH.endswith(".zip") else MODEL_PATH
 agent = PPO.load(
     _model_path_stem,
     custom_objects={
-        # set these to your training values if different
         "lr_schedule": _const(2.5e-4),
         "clip_range": _const(0.2),
     },
@@ -68,61 +57,11 @@ api = REST(ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_BASE_URL, api_version="v2")
 # ── PORTFOLIO STATE (local tracker of shares) ────────────────────────────
 portfolio = {sym: {"shares": 0} for sym in TICKERS}
 
-# ── HELPERS: Indicators (pandas-only, mirrors training) ─────────────────
-def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Expects columns: 'close', 'volume'. Returns df with columns:
-      close, volume, ret, rsi14, macd, macd_signal, bb_width, vol20, volz60
-    """
-    df = df.copy()
-    c = df["close"].astype(float)
-    v = df["volume"].astype(float)
-
-    # Return on chosen timeframe
-    df["ret"] = c.pct_change(periods=RET_WIN)
-
-    # RSI(14)
-    delta = c.diff()
-    gain = delta.clip(lower=0.0).rolling(RSI_WIN, min_periods=RSI_WIN).mean()
-    loss = -delta.clip(upper=0.0).rolling(RSI_WIN, min_periods=RSI_WIN).mean()
-    rs = gain / (loss + 1e-12)
-    df["rsi14"] = 100.0 - (100.0 / (1.0 + rs))
-
-    # MACD(12,26,9)
-    ema_fast = c.ewm(span=MACD_FAST, adjust=False).mean()
-    ema_slow = c.ewm(span=MACD_SLOW, adjust=False).mean()
-    macd_line = ema_fast - ema_slow
-    macd_signal = macd_line.ewm(span=MACD_SIG, adjust=False).mean()
-    df["macd"] = macd_line
-    df["macd_signal"] = macd_signal
-
-    # Bollinger width (20,2) normalized by MA20 magnitude
-    ma = c.rolling(BB_WIN, min_periods=BB_WIN).mean()
-    sd = c.rolling(BB_WIN, min_periods=BB_WIN).std()
-    upper = ma + BB_DEV * sd
-    lower = ma - BB_DEV * sd
-    df["bb_width"] = (upper - lower) / (ma.abs() + 1e-12)
-
-    # Rolling volatility of returns (20)
-    df["vol20"] = df["ret"].rolling(VOL_WIN, min_periods=VOL_WIN).std()
-
-    # Volume z-score (60)
-    mu = v.rolling(VOLZ_WIN, min_periods=VOLZ_WIN).mean()
-    sdv = v.rolling(VOLZ_WIN, min_periods=VOLZ_WIN).std()
-    df["volz60"] = (v - mu) / (sdv + 1e-12)
-
-    df = df.ffill().bfill()
-    needed = ["rsi14", "macd", "macd_signal", "bb_width", "ret", "vol20", "volz60"]
-    df = df.dropna(subset=needed)
-    return df
-
-# ── FIXED: fetch enough history across days/minutes ─────────────────────
+# ── DATA FETCH ───────────────────────────────────────────────────────────
 def get_recent_bars(sym: str, limit: int) -> pd.DataFrame:
     """
-    Fetch enough bars across days so indicators have warmup.
-    - If ALPACA_TIMEFRAME == "day": look back HIST_LOOKBACK_DAYS
-    - Else (minute): look back HIST_LOOKBACK_MINUTES
-    Returns columns: timestamp, open, high, low, close, volume
+    Fetch enough bars across days so WINDOW is always available.
+    Returns columns: timestamp, open, high, low, close, volume (lowercase).
     """
     if ALPACA_TIMEFRAME == "day":
         tf = TimeFrame.Day
@@ -137,7 +76,7 @@ def get_recent_bars(sym: str, limit: int) -> pd.DataFrame:
             timeframe=tf,
             start=start_dt.isoformat(),
             feed=ALPACA_FEED,
-            limit=None  # let server return full range; we'll tail() after
+            limit=None
         ).df
     except APIError as e:
         print(f"  ❌ get_bars error for {sym}: {e}")
@@ -146,62 +85,39 @@ def get_recent_bars(sym: str, limit: int) -> pd.DataFrame:
     if bars is None or bars.empty:
         return pd.DataFrame()
 
-    # Normalize columns
     bars = bars.reset_index()
     bars.columns = [str(c).lower() for c in bars.columns]
-
     cols = [c for c in ["timestamp", "open", "high", "low", "close", "volume"] if c in bars.columns]
     bars = bars[cols].sort_values("timestamp")
 
-    # Tail enough rows to satisfy warmups
+    # Keep a tail big enough to be safe
     if len(bars) > max(limit, HIST_N):
         bars = bars.tail(max(limit, HIST_N)).copy()
-
     return bars
 
+# ── FEATURES: price windows ONLY (matches training obs) ──────────────────
 def build_asset_block(sym: str) -> Tuple[np.ndarray, float]:
     """
     Returns:
-      - feature block for one asset: [WINDOW normalized closes, 7 scalars] as 1-D numpy
-      - latest price (float)
+      - normalized close window of length = WINDOW (1-D float64)
+      - latest close price (float)
     """
     df = get_recent_bars(sym, limit=HIST_N)
     if df.empty or len(df) < WINDOW:
         raise ValueError(f"Not enough bars for {sym} (have {len(df)}, need >= {WINDOW})")
 
-    df_ind = compute_indicators(df)
-    # Ensure we kept enough rows after indicator warmups
-    if len(df_ind) < WINDOW:
-        # One more attempt: extend lookback and recompute
-        df = get_recent_bars(sym, limit=max(HIST_N, 3 * WINDOW))
-        df_ind = compute_indicators(df)
-        if len(df_ind) < WINDOW:
-            raise ValueError(f"Not enough post-indicator rows for {sym} (have {len(df_ind)}, need >= {WINDOW})")
-
-    # WINDOW closes ending at the last bar (exclusive of the next step, mirroring env)
-    closes_win = df_ind["close"].iloc[-WINDOW:].to_numpy(dtype=float)
-    base = float(max(closes_win[0], 1e-12))
-    norm_window = (closes_win / base).astype(np.float64)  # length = WINDOW
-
-    # last scalars
-    needed_cols = ["rsi14", "macd", "macd_signal", "bb_width", "ret", "vol20", "volz60"]
-    missing = [c for c in needed_cols if c not in df_ind.columns]
-    if missing:
-        raise KeyError(f"{sym} missing columns after indicator calc: {missing}")
-
-    last = df_ind.iloc[-1]
-    scalars = np.array([float(last[c]) for c in needed_cols], dtype=np.float64)
-
-    latest_price = float(last["close"])
-    block = np.concatenate([norm_window, scalars], axis=0)  # length = WINDOW + 7
-    return block, latest_price
+    closes = df["close"].to_numpy(dtype=float)
+    window = closes[-WINDOW:]
+    base = float(max(window[0], 1e-12))
+    norm_window = (window / base).astype(np.float64)  # shape = (WINDOW,)
+    latest_price = float(window[-1])
+    return norm_window, latest_price
 
 def softmax(weights: np.ndarray) -> np.ndarray:
     w = weights.astype(np.float64).ravel()
     w = w - np.max(w)
     e = np.exp(w)
-    s = e / (np.sum(e) + 1e-12)
-    return s
+    return e / (np.sum(e) + 1e-12)
 
 # ── MAIN LOOP ────────────────────────────────────────────────────────────
 if __name__ == "__main__":
@@ -217,73 +133,68 @@ if __name__ == "__main__":
                 clock = api.get_clock()
             except Exception as e:
                 print(f"  ❌ get_clock error: {e}")
-                time.sleep(SLEEP_INTERVAL)
-                continue
+                time.sleep(SLEEP_INTERVAL); continue
 
             if not clock.is_open:
                 print(f"  ❌ Market closed, next open at {clock.next_open}")
-                time.sleep(SLEEP_INTERVAL)
-                continue
+                time.sleep(SLEEP_INTERVAL); continue
             print(f"  ⏱ Market open, next close at {clock.next_close}")
 
-            # 2) Refresh account & cash
+            # 2) Account & cash
             try:
                 account = api.get_account()
                 cash = float(account.cash)
             except Exception as e:
                 print(f"  ❌ get_account error: {e}")
-                time.sleep(SLEEP_INTERVAL)
-                continue
+                time.sleep(SLEEP_INTERVAL); continue
 
-            # 3) Build observation (exactly like training layout)
+            # 3) Build observation exactly like training: [K*WINDOW] + [1 cash_ratio] + [K shares]
             blocks = []
             latest_prices = []
             for sym in TICKERS:
                 try:
-                    block, px = build_asset_block(sym)
+                    block, px = build_asset_block(sym)   # (WINDOW,), latest price
                     blocks.append(block)
                     latest_prices.append(px)
-                    # Optional: brief pause to avoid bursty rate limits
-                    # time.sleep(0.05)
                 except Exception as e:
                     print(f"  ⚠️  {sym}: {e}")
 
             if len(blocks) != len(TICKERS):
                 print("  ⚠️  Missing features for one or more tickers, skipping loop.")
-                time.sleep(SLEEP_INTERVAL)
-                continue
+                time.sleep(SLEEP_INTERVAL); continue
 
-            per_asset = np.concatenate(blocks, axis=0)  # K*(W+7)
+            per_asset = np.concatenate(blocks, axis=0)  # shape = K*WINDOW
             latest_prices = np.array(latest_prices, dtype=np.float64)
 
-            # Local portfolio net worth
             shares_vec = np.array([portfolio[s]["shares"] for s in TICKERS], dtype=np.float64)
             pos_val = float(np.sum(shares_vec * latest_prices))
             net_worth = cash + pos_val
             if net_worth <= 0:
                 print("  ❌ Net worth non-positive, skipping.")
-                time.sleep(SLEEP_INTERVAL)
-                continue
+                time.sleep(SLEEP_INTERVAL); continue
 
             cash_ratio = np.array([cash / net_worth], dtype=np.float64)  # (1,)
-            obs = np.concatenate([per_asset, cash_ratio, shares_vec], axis=0).astype(np.float32).reshape(1, -1)
+            obs_vec = np.concatenate([per_asset, cash_ratio, shares_vec], axis=0).astype(np.float32)
+            # Sanity: expect (K*WINDOW + 1 + K,)
+            # print("obs shape:", obs_vec.shape)  # uncomment to verify once
+            obs = obs_vec.reshape(1, -1)
 
             # 4) Policy -> target weights (long-only, sum ≤ 1)
             raw_action, _ = agent.predict(obs, deterministic=True)
             weights = np.clip(raw_action.reshape(-1), 0.0, 1.0)
             total_w = float(weights.sum())
             if total_w > 1.0:
-                weights /= total_w  # keep ≤1
-            # OPTIONAL: always allocate all via softmax (comment above 3 lines if you use this)
+                weights /= total_w
+            # Or force full allocation:
             # weights = softmax(raw_action) * 0.95
 
             # 5) Target allocations
-            investable_value = net_worth  # policy can leave cash via sum(weights) <= 1
+            investable_value = net_worth
             target_values = weights * investable_value
             current_values = shares_vec * latest_prices
-            deltas = target_values - current_values  # $ to add/remove per asset
+            deltas = target_values - current_values  # $ delta per asset
 
-            # 6) Rebalance with market orders (minimal sanity checks)
+            # 6) Rebalance with market orders
             for i, sym in enumerate(TICKERS):
                 px = latest_prices[i]
                 target_shares = int(target_values[i] // max(px, 1e-12))
@@ -294,7 +205,7 @@ if __name__ == "__main__":
 
                 if to_trade > 0:
                     est_cost = to_trade * px
-                    if est_cost > cash * 0.99:   # leave a little cash headroom
+                    if est_cost > cash * 0.99:
                         to_trade = int((cash * 0.99) // max(px, 1e-12))
                     if to_trade <= 0:
                         continue
