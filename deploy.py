@@ -3,6 +3,7 @@ import os
 import time
 from time import perf_counter
 from typing import Tuple
+from datetime import datetime, timedelta, timezone
 
 import numpy as np
 import pandas as pd
@@ -20,10 +21,19 @@ MODEL_PATH = os.environ.get("MODEL_PATH", "ppo_ceemd_cnnlstm_rl.zip")
 INITIAL_CASH = float(os.environ.get("INITIAL_CASH", 10_000))
 SLEEP_INTERVAL = int(os.environ.get("SLEEP_INTERVAL", 60))  # seconds
 
-# Alpaca
+# Alpaca creds
 ALPACA_API_KEY    = os.environ["ALPACA_API_KEY"]
 ALPACA_SECRET_KEY = os.environ["ALPACA_SECRET_KEY"]
 ALPACA_BASE_URL   = os.environ.get("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
+
+# Timeframe + feed (so deployment matches training)
+# ALPACA_TIMEFRAME: "minute" or "day"
+ALPACA_TIMEFRAME = os.environ.get("ALPACA_TIMEFRAME", "minute").lower()
+ALPACA_FEED      = os.environ.get("ALPACA_FEED", "iex")  # "iex" (free) or "sip" (paid)
+
+# Lookback amounts to ensure indicator warmups are satisfied
+HIST_LOOKBACK_MINUTES = int(os.environ.get("HIST_LOOKBACK_MINUTES", 1200))  # ~20 hours of minutes
+HIST_LOOKBACK_DAYS    = int(os.environ.get("HIST_LOOKBACK_DAYS", 120))      # ~6 months daily
 
 # Indicators used in training:
 # RSI(14), MACD(12,26,9), BB width(20,2), Ret (1), Vol20 (20), VolZ60 (60)
@@ -41,7 +51,7 @@ HIST_N = max(300, WINDOW + MACD_SLOW + 50, VOLZ_WIN + 50, BB_WIN + 50)
 def _const(v):
     return lambda _progress: v
 
-# Strip a trailing ".zip" to avoid accidental ".zip.zip" handling in some paths
+# Strip ".zip" to avoid accidental ".zip.zip" in some loaders
 _model_path_stem = MODEL_PATH[:-4] if MODEL_PATH.endswith(".zip") else MODEL_PATH
 agent = PPO.load(
     _model_path_stem,
@@ -101,22 +111,53 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     sdv = v.rolling(VOLZ_WIN, min_periods=VOLZ_WIN).std()
     df["volz60"] = (v - mu) / (sdv + 1e-12)
 
-    # forward/back fill just in case, then drop rows still NaN on key features
     df = df.ffill().bfill()
     needed = ["rsi14", "macd", "macd_signal", "bb_width", "ret", "vol20", "volz60"]
     df = df.dropna(subset=needed)
     return df
 
+# ── FIXED: fetch enough history across days/minutes ─────────────────────
 def get_recent_bars(sym: str, limit: int) -> pd.DataFrame:
-    # Pull latest minute bars; adjust timeframe if you trained on another frame
-    bars = api.get_bars(symbol=sym, timeframe=TimeFrame.Minute, limit=limit).df
-    if bars.empty:
+    """
+    Fetch enough bars across days so indicators have warmup.
+    - If ALPACA_TIMEFRAME == "day": look back HIST_LOOKBACK_DAYS
+    - Else (minute): look back HIST_LOOKBACK_MINUTES
+    Returns columns: timestamp, open, high, low, close, volume
+    """
+    if ALPACA_TIMEFRAME == "day":
+        tf = TimeFrame.Day
+        start_dt = datetime.now(timezone.utc) - timedelta(days=HIST_LOOKBACK_DAYS)
+    else:
+        tf = TimeFrame.Minute
+        start_dt = datetime.now(timezone.utc) - timedelta(minutes=HIST_LOOKBACK_MINUTES)
+
+    try:
+        bars = api.get_bars(
+            symbol=sym,
+            timeframe=tf,
+            start=start_dt.isoformat(),
+            feed=ALPACA_FEED,
+            limit=None  # let server return full range; we'll tail() after
+        ).df
+    except APIError as e:
+        print(f"  ❌ get_bars error for {sym}: {e}")
         return pd.DataFrame()
-    # For single symbol, Alpaca returns single-index DF; ensure columns lower-case
+
+    if bars is None or bars.empty:
+        return pd.DataFrame()
+
+    # Normalize columns
     bars = bars.reset_index()
     bars.columns = [str(c).lower() for c in bars.columns]
+
     cols = [c for c in ["timestamp", "open", "high", "low", "close", "volume"] if c in bars.columns]
-    return bars[cols].copy()
+    bars = bars[cols].sort_values("timestamp")
+
+    # Tail enough rows to satisfy warmups
+    if len(bars) > max(limit, HIST_N):
+        bars = bars.tail(max(limit, HIST_N)).copy()
+
+    return bars
 
 def build_asset_block(sym: str) -> Tuple[np.ndarray, float]:
     """
@@ -129,8 +170,13 @@ def build_asset_block(sym: str) -> Tuple[np.ndarray, float]:
         raise ValueError(f"Not enough bars for {sym} (have {len(df)}, need >= {WINDOW})")
 
     df_ind = compute_indicators(df)
+    # Ensure we kept enough rows after indicator warmups
     if len(df_ind) < WINDOW:
-        raise ValueError(f"Not enough post-indicator rows for {sym} (have {len(df_ind)}, need >= {WINDOW})")
+        # One more attempt: extend lookback and recompute
+        df = get_recent_bars(sym, limit=max(HIST_N, 3 * WINDOW))
+        df_ind = compute_indicators(df)
+        if len(df_ind) < WINDOW:
+            raise ValueError(f"Not enough post-indicator rows for {sym} (have {len(df_ind)}, need >= {WINDOW})")
 
     # WINDOW closes ending at the last bar (exclusive of the next step, mirroring env)
     closes_win = df_ind["close"].iloc[-WINDOW:].to_numpy(dtype=float)
@@ -144,10 +190,7 @@ def build_asset_block(sym: str) -> Tuple[np.ndarray, float]:
         raise KeyError(f"{sym} missing columns after indicator calc: {missing}")
 
     last = df_ind.iloc[-1]
-    scalars = np.array(
-        [float(last[c]) for c in needed_cols],
-        dtype=np.float64
-    )
+    scalars = np.array([float(last[c]) for c in needed_cols], dtype=np.float64)
 
     latest_price = float(last["close"])
     block = np.concatenate([norm_window, scalars], axis=0)  # length = WINDOW + 7
@@ -170,7 +213,13 @@ if __name__ == "__main__":
             print(f"\n🔄 Loop start: {now.strftime('%Y-%m-%d %H:%M:%S %Z')}", flush=True)
 
             # 1) Market check
-            clock = api.get_clock()
+            try:
+                clock = api.get_clock()
+            except Exception as e:
+                print(f"  ❌ get_clock error: {e}")
+                time.sleep(SLEEP_INTERVAL)
+                continue
+
             if not clock.is_open:
                 print(f"  ❌ Market closed, next open at {clock.next_open}")
                 time.sleep(SLEEP_INTERVAL)
@@ -178,20 +227,25 @@ if __name__ == "__main__":
             print(f"  ⏱ Market open, next close at {clock.next_close}")
 
             # 2) Refresh account & cash
-            account = api.get_account()
-            cash = float(account.cash)
+            try:
+                account = api.get_account()
+                cash = float(account.cash)
+            except Exception as e:
+                print(f"  ❌ get_account error: {e}")
+                time.sleep(SLEEP_INTERVAL)
+                continue
 
             # 3) Build observation (exactly like training layout)
             blocks = []
             latest_prices = []
-            failed = []
             for sym in TICKERS:
                 try:
                     block, px = build_asset_block(sym)
                     blocks.append(block)
                     latest_prices.append(px)
+                    # Optional: brief pause to avoid bursty rate limits
+                    # time.sleep(0.05)
                 except Exception as e:
-                    failed.append((sym, str(e)))
                     print(f"  ⚠️  {sym}: {e}")
 
             if len(blocks) != len(TICKERS):
@@ -220,7 +274,7 @@ if __name__ == "__main__":
             total_w = float(weights.sum())
             if total_w > 1.0:
                 weights /= total_w  # keep ≤1
-            # OPTIONAL: always allocate all via softmax (comment out above two lines if you use this)
+            # OPTIONAL: always allocate all via softmax (comment above 3 lines if you use this)
             # weights = softmax(raw_action) * 0.95
 
             # 5) Target allocations
